@@ -14,10 +14,17 @@ export type DurableWalEntry =
   | { readonly type: "io"; readonly action: DurableIoAction };
 
 export type DurableVariables = Record<string, unknown>;
-export type DurableComputationStates = Record<string, number>;
+export type DurableComputationState = {
+  readonly step: number;
+  readonly vars: DurableVariables;
+};
+export type DurableComputationStates = Record<string, DurableComputationState>;
 export type DurableState = {
   readonly computations: DurableComputationStates;
-  readonly vars: DurableVariables;
+};
+export type DurableWal = {
+  readonly computation: string | null;
+  readonly entries: readonly DurableWalEntry[];
 };
 export type DurableStep = (ctx: DurableContext) => void | Promise<void>;
 export type DurableOutput = (line: string) => void | Promise<void>;
@@ -74,14 +81,13 @@ class DurableStore {
   ensureComputation(name: string): void {
     const state = this.readStateSync();
     if (state.computations[name] !== undefined) return;
-    state.computations[name] = 0;
+    state.computations[name] = { step: 0, vars: {} };
     writeJsonSync(this.statePath, state);
   }
 
   async readStep(name: string): Promise<number> {
     const state = await readJson(this.statePath, EMPTY_STATE);
-    const step = state.computations[name];
-    if (step === undefined) return 0;
+    const step = state.computations[name]?.step ?? 0;
     if (!Number.isInteger(step) || step < 0) {
       throw new DurableComputationError(`Stored state for computation "${name}" must be a non-negative integer`);
     }
@@ -90,32 +96,42 @@ class DurableStore {
 
   writeStepSync(name: string, step: number): void {
     const state = this.readStateSync();
-    state.computations[name] = step;
+    const computation = state.computations[name];
+    state.computations[name] = { step, vars: computation?.vars ?? {} };
     writeJsonSync(this.statePath, state);
   }
 
   clearWalSync(): void {
-    writeJsonSync(this.walPath, []);
+    writeJsonSync(this.walPath, EMPTY_WAL);
   }
 
-  readVariablesSync(): DurableVariables {
-    return this.readStateSync().vars;
+  readVariablesSync(name: string): DurableVariables {
+    return this.readStateSync().computations[name]?.vars ?? {};
   }
 
   async commitWal(): Promise<void> {
     const wal = await readJson(this.walPath, EMPTY_WAL);
-    if (wal.length === 0) return;
+    if (wal.entries.length === 0) return;
+    if (wal.computation === null) {
+      throw new DurableComputationError("WAL contains entries without a computation name");
+    }
 
     const state = await readJson(this.statePath, EMPTY_STATE);
+    let computation = state.computations[wal.computation];
     let stateDirty = false;
+    if (computation === undefined) {
+      computation = { step: 0, vars: {} };
+      state.computations[wal.computation] = computation;
+      stateDirty = true;
+    }
 
-    for (const entry of wal) {
+    for (const entry of wal.entries) {
       switch (entry.type) {
         case "file":
           await this.commitFileEntry(entry);
           break;
         case "var":
-          state.vars[entry.name] = cloneJson(entry.action.args[0]);
+          computation.vars[entry.name] = cloneJson(entry.action.args[0]);
           stateDirty = true;
           break;
         case "io":
@@ -125,7 +141,7 @@ class DurableStore {
     }
 
     if (stateDirty) await writeJson(this.statePath, state);
-    await writeJson(this.walPath, []);
+    await writeJson(this.walPath, EMPTY_WAL);
   }
 
   resolveDataPath(name: string): string {
@@ -184,6 +200,7 @@ class DurableContextImpl implements DurableContext {
 
   constructor(
     private readonly store: DurableStore,
+    private readonly computationName: string,
     variables: DurableVariables,
   ) {
     this.variables = cloneJson(variables);
@@ -221,7 +238,7 @@ class DurableContextImpl implements DurableContext {
 
   appendWalEntry(entry: DurableWalEntry): void {
     this.wal.push(cloneJson(entry));
-    writeJsonSync(this.store.walPath, this.wal);
+    writeJsonSync(this.store.walPath, { computation: this.computationName, entries: this.wal });
   }
 }
 
@@ -250,7 +267,7 @@ class DurableComputationImpl implements DurableComputation {
     while (stepIndex < this.steps.length) {
       await this.store.commitWal();
       const step = this.steps[stepIndex]!;
-      const ctx = new DurableContextImpl(this.store, this.store.readVariablesSync());
+      const ctx = new DurableContextImpl(this.store, this.name, this.store.readVariablesSync(this.name));
       try {
         await step(ctx);
       } catch (cause) {
@@ -286,8 +303,8 @@ export class DurableComputationFactory {
 
 export default DurableComputationFactory;
 
-const EMPTY_WAL: DurableWalEntry[] = [];
-const EMPTY_STATE: DurableState = { computations: {}, vars: {} };
+const EMPTY_WAL: DurableWal = { computation: null, entries: [] };
+const EMPTY_STATE: DurableState = { computations: {} };
 
 const isNotFound = (cause: unknown): boolean =>
   typeof cause === "object" && cause !== null && "code" in cause && (cause as NodeJS.ErrnoException).code === "ENOENT";

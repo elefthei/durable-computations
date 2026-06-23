@@ -64,7 +64,7 @@ await dc
 
 For a factory created with `dir`, the runtime manages:
 
-- `wal.json` — the current step's write-ahead log.
-- `state.json` — completed step indexes under `computations` and JSON-serialized persistent variables under `vars`.
+- `wal.json` — the current step's write-ahead log plus its owning computation name.
+- `state.json` — one entry per durable computation under computations; each entry stores step and vars.
 
 File paths opened through `ctx.open(path)` are resolved under `dir` and cannot escape it.

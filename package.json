@@ -1,0 +1,32 @@
+{
+  "name": "durable-computations",
+  "version": "0.0.1",
+  "description": "Persistent task monad with an atomically persisted write-ahead log.",
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./main": {
+      "types": "./dist/main.d.ts",
+      "import": "./dist/main.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test ./test/*.test.ts",
+    "start": "bun src/main.ts"
+  },
+  "dependencies": {
+    "atomically": "^2.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}

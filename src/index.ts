@@ -15,6 +15,10 @@ export type DurableWalEntry =
 
 export type DurableVariables = Record<string, unknown>;
 export type DurableComputationStates = Record<string, number>;
+export type DurableState = {
+  readonly computations: DurableComputationStates;
+  readonly vars: DurableVariables;
+};
 export type DurableStep = (ctx: DurableContext) => void | Promise<void>;
 export type DurableOutput = (line: string) => void | Promise<void>;
 
@@ -56,29 +60,27 @@ export class DurableComputationError extends Error {
 class DurableStore {
   readonly dir: string;
   readonly walPath: string;
-  readonly varsPath: string;
   readonly statePath: string;
   private readonly output: DurableOutput;
 
   constructor(options: DurableComputationFactoryOptions) {
     this.dir = resolve(options.dir);
     this.walPath = resolve(this.dir, "wal.json");
-    this.varsPath = resolve(this.dir, "vars.json");
     this.statePath = resolve(this.dir, "state.json");
     this.output = options.output ?? ((line) => console.log(line));
     this.ensureFiles();
   }
 
   ensureComputation(name: string): void {
-    const states = this.readStatesSync();
-    if (states[name] !== undefined) return;
-    states[name] = 0;
-    writeJsonSync(this.statePath, states);
+    const state = this.readStateSync();
+    if (state.computations[name] !== undefined) return;
+    state.computations[name] = 0;
+    writeJsonSync(this.statePath, state);
   }
 
   async readStep(name: string): Promise<number> {
-    const states = await readJson(this.statePath, EMPTY_STATES);
-    const step = states[name];
+    const state = await readJson(this.statePath, EMPTY_STATE);
+    const step = state.computations[name];
     if (step === undefined) return 0;
     if (!Number.isInteger(step) || step < 0) {
       throw new DurableComputationError(`Stored state for computation "${name}" must be a non-negative integer`);
@@ -87,26 +89,25 @@ class DurableStore {
   }
 
   writeStepSync(name: string, step: number): void {
-    const states = this.readStatesSync();
-    states[name] = step;
-    writeJsonSync(this.statePath, states);
+    const state = this.readStateSync();
+    state.computations[name] = step;
+    writeJsonSync(this.statePath, state);
   }
-
 
   clearWalSync(): void {
     writeJsonSync(this.walPath, []);
   }
 
   readVariablesSync(): DurableVariables {
-    return readJsonSync(this.varsPath, EMPTY_VARIABLES);
+    return this.readStateSync().vars;
   }
 
   async commitWal(): Promise<void> {
     const wal = await readJson(this.walPath, EMPTY_WAL);
     if (wal.length === 0) return;
 
-    const vars = await readJson(this.varsPath, EMPTY_VARIABLES);
-    let varsDirty = false;
+    const state = await readJson(this.statePath, EMPTY_STATE);
+    let stateDirty = false;
 
     for (const entry of wal) {
       switch (entry.type) {
@@ -114,8 +115,8 @@ class DurableStore {
           await this.commitFileEntry(entry);
           break;
         case "var":
-          vars[entry.name] = cloneJson(entry.action.args[0]);
-          varsDirty = true;
+          state.vars[entry.name] = cloneJson(entry.action.args[0]);
+          stateDirty = true;
           break;
         case "io":
           await this.output(entry.action.args[0]);
@@ -123,7 +124,7 @@ class DurableStore {
       }
     }
 
-    if (varsDirty) await writeJson(this.varsPath, vars);
+    if (stateDirty) await writeJson(this.statePath, state);
     await writeJson(this.walPath, []);
   }
 
@@ -139,16 +140,11 @@ class DurableStore {
 
   private ensureFiles(): void {
     ensureJsonFileSync(this.walPath, EMPTY_WAL);
-    ensureJsonFileSync(this.varsPath, EMPTY_VARIABLES);
-    ensureJsonFileSync(this.statePath, EMPTY_STATES);
+    ensureJsonFileSync(this.statePath, EMPTY_STATE);
   }
 
-  private readWalSync(): DurableWalEntry[] {
-    return readJsonSync(this.walPath, EMPTY_WAL);
-  }
-
-  private readStatesSync(): DurableComputationStates {
-    return readJsonSync(this.statePath, EMPTY_STATES);
+  private readStateSync(): DurableState {
+    return readJsonSync(this.statePath, EMPTY_STATE);
   }
 
   private async commitFileEntry(entry: Extract<DurableWalEntry, { readonly type: "file" }>): Promise<void> {
@@ -291,8 +287,7 @@ export class DurableComputationFactory {
 export default DurableComputationFactory;
 
 const EMPTY_WAL: DurableWalEntry[] = [];
-const EMPTY_VARIABLES: DurableVariables = {};
-const EMPTY_STATES: DurableComputationStates = {};
+const EMPTY_STATE: DurableState = { computations: {}, vars: {} };
 
 const isNotFound = (cause: unknown): boolean =>
   typeof cause === "object" && cause !== null && "code" in cause && (cause as NodeJS.ErrnoException).code === "ENOENT";

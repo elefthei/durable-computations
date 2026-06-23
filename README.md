@@ -22,7 +22,7 @@ Use an explicit durable state directory:
 bun run start /tmp/durable-file-move
 ```
 
-The demo writes `foo.txt`, updates `vars.json`, clears `wal.json`, and prints `Written 11 bytes`.
+The demo writes `foo.txt`, updates `state.json`, clears `wal.json`, and prints `Written 11 bytes`.
 
 ## Test and build
 
@@ -65,7 +65,6 @@ await dc
 For a factory created with `dir`, the runtime manages:
 
 - `wal.json` — the current step's write-ahead log.
-- `vars.json` — JSON-serialized persistent variables.
-- `state.json` — completed step index per computation name.
+- `state.json` — completed step indexes under `computations` and JSON-serialized persistent variables under `vars`.
 
 File paths opened through `ctx.open(path)` are resolved under `dir` and cannot escape it.

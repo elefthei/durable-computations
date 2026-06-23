@@ -37,9 +37,12 @@ test("durable computation commits file, variable, and print WAL entries", async 
       .run();
 
     assert.equal(await readFile(join(dir, "foo.txt"), "utf8"), "hello world");
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "vars.json"), "utf8")), { stats: { written: true, size: 11 } });
     assert.deepEqual(JSON.parse(await readFile(join(dir, "wal.json"), "utf8")), []);
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), { file_move: 3 });
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), {
+      computations: { file_move: 3 },
+      vars: { stats: { written: true, size: 11 } },
+    });
+    await assert.rejects(readFile(join(dir, "vars.json"), "utf8"), /ENOENT/);
     assert.deepEqual(printed, ["Written 11 bytes"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -62,6 +65,10 @@ test("ctx operations mirror an in-memory WAL before commit", async () => {
         ctx.set("stats", { written: true, size: 6 });
 
         assert.deepEqual(JSON.parse(await readFile(join(dir, "wal.json"), "utf8")), expectedWal);
+        assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), {
+          computations: { wal_probe: 0 },
+          vars: {},
+        });
         await assert.rejects(readFile(join(dir, "foo.txt"), "utf8"), /ENOENT/);
       })
       .run();
@@ -91,9 +98,9 @@ test("failing step clears its WAL and does not advance state", async () => {
     );
 
     await assert.rejects(readFile(join(dir, "bad.txt"), "utf8"), /ENOENT/);
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "vars.json"), "utf8")), {});
     assert.deepEqual(JSON.parse(await readFile(join(dir, "wal.json"), "utf8")), []);
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), { failure: 0 });
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), { computations: { failure: 0 }, vars: {} });
+    await assert.rejects(readFile(join(dir, "vars.json"), "utf8"), /ENOENT/);
 
     await factory
       .create("failure")
@@ -104,8 +111,10 @@ test("failing step clears its WAL and does not advance state", async () => {
       .run();
 
     assert.equal(await readFile(join(dir, "bad.txt"), "utf8"), "complete");
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "vars.json"), "utf8")), { stats: { written: true, size: 8 } });
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), { failure: 1 });
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), {
+      computations: { failure: 1 },
+      vars: { stats: { written: true, size: 8 } },
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -121,8 +130,7 @@ test("run commits pending WAL before resuming at stored state", async () => {
         { type: "var", name: "stats", action: { type: "Set", args: [{ written: true, size: 6 }] } },
       ])}\n`,
     );
-    await atomicWriteFile(join(dir, "vars.json"), "{}\n");
-    await atomicWriteFile(join(dir, "state.json"), `${JSON.stringify({ file_move: 1 })}\n`);
+    await atomicWriteFile(join(dir, "state.json"), `${JSON.stringify({ computations: { file_move: 1 }, vars: {} })}\n`);
 
     const factory = DurableComputationFactory.new({ dir, output: () => {} });
 
@@ -138,9 +146,11 @@ test("run commits pending WAL before resuming at stored state", async () => {
       .run();
 
     assert.equal(await readFile(join(dir, "foo.txt"), "utf8"), "hello world");
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "vars.json"), "utf8")), { stats: { written: true, size: 11 } });
     assert.deepEqual(JSON.parse(await readFile(join(dir, "wal.json"), "utf8")), []);
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), { file_move: 2 });
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), {
+      computations: { file_move: 2 },
+      vars: { stats: { written: true, size: 11 } },
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -154,7 +164,11 @@ test("main runs the file_move durable computation", async () => {
     assert.equal(await main({ dir, output: (line) => { printed.push(line); } }), dir);
 
     assert.equal(await readFile(join(dir, "foo.txt"), "utf8"), "hello world");
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "vars.json"), "utf8")), { stats: { written: true, size: 11 } });
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), {
+      computations: { file_move: 3 },
+      vars: { stats: { written: true, size: 11 } },
+    });
+    await assert.rejects(readFile(join(dir, "vars.json"), "utf8"), /ENOENT/);
     assert.deepEqual(printed, ["Written 11 bytes"]);
   } finally {
     await rm(dir, { recursive: true, force: true });

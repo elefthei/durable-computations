@@ -39,6 +39,40 @@ const expectNoFile = async (path: string): Promise<void> => {
   await assert.rejects(readFile(path, "utf8"), /ENOENT/);
 };
 
+const isNotFound = (cause: unknown): boolean =>
+  typeof cause === "object" && cause !== null && "code" in cause && (cause as NodeJS.ErrnoException).code === "ENOENT";
+
+const readTextIfExists = async (path: string): Promise<string | undefined> => {
+  try {
+    return await readFile(path, "utf8");
+  } catch (cause) {
+    if (isNotFound(cause)) return undefined;
+    throw cause;
+  }
+};
+
+const loadNumberIfSet = (ctx: { load<T = unknown>(name: string): T }, name: string): number | undefined => {
+  try {
+    return ctx.load<number>(name);
+  } catch (cause) {
+    if (cause instanceof Error && cause.message === `Durable variable "${name}" is not set`) return undefined;
+    throw cause;
+  }
+};
+
+const expectedRecoveredVars = (crashAt: number): Record<string, unknown> => {
+  switch (crashAt) {
+    case 2:
+      return { a: 5, recoveredA: 3 };
+    case 3:
+      return { a: 5, recoveredA: 5 };
+    case 5:
+      return { a: 5, recoveredFile: "hello " };
+    default:
+      return { a: 5 };
+  }
+};
+
 class CrashContext {
   private counter = 0;
 
@@ -58,14 +92,18 @@ const runCrashTest = async (dir: string, crashAt: number): Promise<void> => {
     .create("test_computation")
     .next((ctx) => {
       cr.crash();
+      const recoveredA = loadNumberIfSet(ctx, "a");
+      if (recoveredA !== undefined) ctx.set("recoveredA", recoveredA);
       ctx.set("a", 3);
       cr.crash();
       ctx.modify<number>("a", (a) => a + 2);
       cr.crash();
     })
-    .next((ctx) => {
+    .next(async (ctx) => {
       const fd = ctx.open("foo.txt");
       cr.crash();
+      const recoveredFile = await readTextIfExists(join(dir, "foo.txt"));
+      if (recoveredFile !== undefined) ctx.set("recoveredFile", recoveredFile);
       fd.write("hello ");
       cr.crash();
       fd.append("world");
@@ -187,7 +225,7 @@ if (process.argv[2] === CHILD_MODE) {
         assert.equal(recovered.code, 0, formatChildResult(recovered));
         assert.equal(recovered.signal, null, formatChildResult(recovered));
         assert.deepEqual(await readJson(statePath), {
-          computations: { test_computation: { step: 3, vars: { a: 5 } } },
+          computations: { test_computation: { step: 3, vars: expectedRecoveredVars(crashAt) } },
         });
         assert.deepEqual(await readJson(walPath), { computation: null, entries: [] });
         assert.equal(await readFile(fooPath, "utf8"), "hello world");

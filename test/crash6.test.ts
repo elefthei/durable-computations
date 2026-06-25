@@ -1,6 +1,7 @@
 import { test } from "bun:test";
 import { runCrashRecoveryCase } from "./crash-recovery.ts";
 
+// Crash 6 exits after step 2 commits and before the final step.
 test("crash 6 preserves second committed step and recovers", async () => {
   await runCrashRecoveryCase(import.meta.url, {
     crashAt: 6,

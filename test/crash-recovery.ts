@@ -6,8 +6,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DurableComputationFactory } from "../src/index.ts";
 
+// Child processes receive this argv marker instead of registering tests.
 const CHILD_MODE = "--durable-crash-recovery-child";
 
+// Each crash file supplies one pre-recovery state and its final witness vars.
 export type CrashRecoveryCase = {
   readonly crashAt: number;
   readonly state: unknown;
@@ -16,6 +18,7 @@ export type CrashRecoveryCase = {
   readonly recoveredVars: Record<string, unknown>;
 };
 
+// Captured child exits turn process crashes into parent-side assertions.
 type ChildRunResult = {
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;
@@ -23,14 +26,18 @@ type ChildRunResult = {
   readonly stderr: string;
 };
 
+// Rejections keep child diagnostics attached to the thrown Error.
 type ChildRunError = Error & ChildRunResult;
 
+// Format the child exit and captured streams for assertion failures.
 const formatChildResult = (result: ChildRunResult): string =>
   `code=${result.code} signal=${result.signal} stdout=${JSON.stringify(result.stdout)} stderr=${JSON.stringify(result.stderr)}`;
 
+// Wrap a non-zero child exit in an Error without losing diagnostics.
 const childRunError = (result: ChildRunResult): ChildRunError =>
   Object.assign(new Error(formatChildResult(result)), result);
 
+// Decode only errors produced by runChild's crash wrapper.
 const assertChildRunError = (cause: unknown): ChildRunError => {
   assert(cause instanceof Error, `expected child run error, got ${String(cause)}`);
   assert("code" in cause, cause.message);
@@ -40,12 +47,15 @@ const assertChildRunError = (cause: unknown): ChildRunError => {
   return cause as ChildRunError;
 };
 
+// Read persisted JSON exactly as the parent process observes it.
 const readJson = async (path: string): Promise<unknown> => JSON.parse(await readFile(path, "utf8"));
 
+// Missing files prove a durable file action has not committed yet.
 const expectNoFile = async (path: string): Promise<void> => {
   await assert.rejects(readFile(path, "utf8"), /ENOENT/);
 };
 
+// A null expectation means the durable file must not exist yet.
 const expectFile = async (path: string, expected: string | null): Promise<void> => {
   if (expected === null) {
     await expectNoFile(path);
@@ -55,9 +65,11 @@ const expectFile = async (path: string, expected: string | null): Promise<void> 
   assert.equal(await readFile(path, "utf8"), expected);
 };
 
+// ENOENT is the only swallowed filesystem error in recovery probes.
 const isNotFound = (cause: unknown): boolean =>
   typeof cause === "object" && cause !== null && "code" in cause && (cause as NodeJS.ErrnoException).code === "ENOENT";
 
+// Recovery witnesses read committed file content before rerunning a step.
 const readTextIfExists = async (path: string): Promise<string | undefined> => {
   try {
     return await readFile(path, "utf8");
@@ -67,6 +79,7 @@ const readTextIfExists = async (path: string): Promise<string | undefined> => {
   }
 };
 
+// Recovery witnesses read committed variables without creating them.
 const loadNumberIfSet = (ctx: { load<T = unknown>(name: string): T }, name: string): number | undefined => {
   try {
     return ctx.load<number>(name);
@@ -76,17 +89,21 @@ const loadNumberIfSet = (ctx: { load<T = unknown>(name: string): T }, name: stri
   }
 };
 
+// CrashContext maps each checkpoint to a deterministic process exit code.
 class CrashContext {
   private counter = 0;
 
+  // crashAt=0 disables exits for recovery runs.
   constructor(private readonly crashAt: number) {}
 
+  // Each call advances exactly one crash checkpoint.
   crash(): void {
     this.counter += 1;
     if (this.crashAt === this.counter) process.exit(70 + this.counter);
   }
 }
 
+// The child runs the same durable workflow for crash and recovery modes.
 const runCrashTest = async (dir: string, crashAt: number): Promise<void> => {
   const cr = new CrashContext(crashAt);
   const dc = DurableComputationFactory.new({ dir, output: () => {} });
@@ -117,6 +134,7 @@ const runCrashTest = async (dir: string, crashAt: number): Promise<void> => {
     .run();
 };
 
+// Fork the test module so process.exit simulates a system crash.
 const runChild = (testModuleUrl: string | URL, dir: string, crashAt: number): Promise<ChildRunResult> => {
   const { promise, resolve, reject } = Promise.withResolvers<ChildRunResult>();
   const child = fork(fileURLToPath(testModuleUrl), [CHILD_MODE, dir, String(crashAt)], { silent: true });
@@ -141,6 +159,7 @@ const runChild = (testModuleUrl: string | URL, dir: string, crashAt: number): Pr
   return promise;
 };
 
+// One parent test drives one crash point, inspects disk, then recovers.
 export const runCrashRecoveryCase = async (testModuleUrl: string | URL, crashCase: CrashRecoveryCase): Promise<void> => {
   const dir = await mkdtemp(join(tmpdir(), `durable-crash${crashCase.crashAt}-`));
   try {
@@ -173,6 +192,7 @@ export const runCrashRecoveryCase = async (testModuleUrl: string | URL, crashCas
   }
 };
 
+// Child mode exits before Bun registers or runs parent-side tests.
 if (process.argv[2] === CHILD_MODE) {
   const dir = process.argv[3];
   const crashAt = Number(process.argv[4] ?? Number.NaN);

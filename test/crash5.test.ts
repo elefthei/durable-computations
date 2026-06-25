@@ -1,6 +1,7 @@
 import { test } from "bun:test";
 import { runCrashRecoveryCase } from "./crash-recovery.ts";
 
+// Crash 5 exits after a pending file Write reaches the WAL.
 test("crash 5 preserves pending file write and recovers", async () => {
   await runCrashRecoveryCase(import.meta.url, {
     crashAt: 5,

@@ -1,6 +1,7 @@
 import { test } from "bun:test";
 import { runCrashRecoveryCase } from "./crash-recovery.ts";
 
+// Crash 2 exits after a pending variable Set reaches the WAL.
 test("crash 2 preserves pending variable set and recovers", async () => {
   await runCrashRecoveryCase(import.meta.url, {
     crashAt: 2,

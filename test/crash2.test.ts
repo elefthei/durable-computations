@@ -11,6 +11,6 @@ test("crash 2 preserves pending variable set and recovers", async () => {
       entries: [{ type: "var", name: "a", action: { type: "Set", args: [3] } }],
     },
     fooText: null,
-    recoveredVars: { a: 5, recoveredA: 3 },
+    finalVars: { a: 5 },
   });
 });

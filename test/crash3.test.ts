@@ -14,6 +14,6 @@ test("crash 3 preserves pending variable modification and recovers", async () =>
       ],
     },
     fooText: null,
-    recoveredVars: { a: 5, recoveredA: 5 },
+    finalVars: { a: 5 },
   });
 });

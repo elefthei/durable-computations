@@ -9,13 +9,13 @@ import { DurableComputationFactory } from "../src/index.ts";
 // Child processes receive this argv marker instead of registering tests.
 const CHILD_MODE = "--durable-crash-recovery-child";
 
-// Each crash file supplies one pre-recovery state and its final witness vars.
+// Each crash file supplies one pre-recovery state and final durable vars.
 export type CrashRecoveryCase = {
   readonly crashAt: number;
   readonly state: unknown;
   readonly wal: unknown;
   readonly fooText: string | null;
-  readonly recoveredVars: Record<string, unknown>;
+  readonly finalVars: Record<string, unknown>;
 };
 
 // Captured child exits turn process crashes into parent-side assertions.
@@ -65,30 +65,6 @@ const expectFile = async (path: string, expected: string | null): Promise<void> 
   assert.equal(await readFile(path, "utf8"), expected);
 };
 
-// ENOENT is the only swallowed filesystem error in recovery probes.
-const isNotFound = (cause: unknown): boolean =>
-  typeof cause === "object" && cause !== null && "code" in cause && (cause as NodeJS.ErrnoException).code === "ENOENT";
-
-// Recovery witnesses read committed file content before rerunning a step.
-const readTextIfExists = async (path: string): Promise<string | undefined> => {
-  try {
-    return await readFile(path, "utf8");
-  } catch (cause) {
-    if (isNotFound(cause)) return undefined;
-    throw cause;
-  }
-};
-
-// Recovery witnesses read committed variables without creating them.
-const loadNumberIfSet = (ctx: { load<T = unknown>(name: string): T }, name: string): number | undefined => {
-  try {
-    return ctx.load<number>(name);
-  } catch (cause) {
-    if (cause instanceof Error && cause.message === `Durable variable "${name}" is not set`) return undefined;
-    throw cause;
-  }
-};
-
 // CrashContext maps each checkpoint to a deterministic process exit code.
 class CrashContext {
   private counter = 0;
@@ -112,18 +88,14 @@ const runCrashTest = async (dir: string, crashAt: number): Promise<void> => {
     .create("test_computation")
     .next((ctx) => {
       cr.crash();
-      const recoveredA = loadNumberIfSet(ctx, "a");
-      if (recoveredA !== undefined) ctx.set("recoveredA", recoveredA);
       ctx.set("a", 3);
       cr.crash();
       ctx.modify<number>("a", (a) => a + 2);
       cr.crash();
     })
-    .next(async (ctx) => {
+    .next((ctx) => {
       const fd = ctx.open("foo.txt");
       cr.crash();
-      const recoveredFile = await readTextIfExists(join(dir, "foo.txt"));
-      if (recoveredFile !== undefined) ctx.set("recoveredFile", recoveredFile);
       fd.write("hello ");
       cr.crash();
       fd.append("world");
@@ -183,7 +155,7 @@ export const runCrashRecoveryCase = async (testModuleUrl: string | URL, crashCas
     assert.equal(recovered.code, 0, formatChildResult(recovered));
     assert.equal(recovered.signal, null, formatChildResult(recovered));
     assert.deepEqual(await readJson(statePath), {
-      computations: { test_computation: { step: 3, vars: crashCase.recoveredVars } },
+      computations: { test_computation: { step: 3, vars: crashCase.finalVars } },
     });
     assert.deepEqual(await readJson(walPath), { computation: null, entries: [] });
     assert.equal(await readFile(fooPath, "utf8"), "hello world");

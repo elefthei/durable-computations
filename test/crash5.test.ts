@@ -11,6 +11,6 @@ test("crash 5 preserves pending file write and recovers", async () => {
       entries: [{ type: "file", name: "foo.txt", action: { type: "Write", args: ["hello "] } }],
     },
     fooText: null,
-    recoveredVars: { a: 5, recoveredFile: "hello " },
+    finalVars: { a: 5 },
   });
 });

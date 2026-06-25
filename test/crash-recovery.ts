@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,13 +9,17 @@ import { DurableComputationFactory } from "../src/index.ts";
 // Child processes receive this argv marker instead of registering tests.
 const CHILD_MODE = "--durable-crash-recovery-child";
 
-// Each crash file supplies one pre-recovery state and final durable vars.
+// Durable file expectations map filenames to exact contents.
+type ExpectedFiles = Readonly<Record<string, string>>;
+
+// Each crash file supplies disk state before and after recovery.
 export type CrashRecoveryCase = {
   readonly crashAt: number;
-  readonly state: unknown;
-  readonly wal: unknown;
-  readonly fooText: string | null;
-  readonly finalVars: Record<string, unknown>;
+  readonly crashedState: unknown;
+  readonly crashedWal: unknown;
+  readonly crashedFiles: ExpectedFiles;
+  readonly recoveredVars: Record<string, unknown>;
+  readonly recoveredFiles: ExpectedFiles;
 };
 
 // Captured child exits turn process crashes into parent-side assertions.
@@ -50,19 +54,25 @@ const assertChildRunError = (cause: unknown): ChildRunError => {
 // Read persisted JSON exactly as the parent process observes it.
 const readJson = async (path: string): Promise<unknown> => JSON.parse(await readFile(path, "utf8"));
 
-// Missing files prove a durable file action has not committed yet.
-const expectNoFile = async (path: string): Promise<void> => {
-  await assert.rejects(readFile(path, "utf8"), /ENOENT/);
-};
-
-// A null expectation means the durable file must not exist yet.
-const expectFile = async (path: string, expected: string | null): Promise<void> => {
-  if (expected === null) {
-    await expectNoFile(path);
-    return;
+// Runtime metadata files are not durable outputs asserted by recoveredFiles.
+const readDurableFiles = async (dir: string): Promise<Record<string, string>> => {
+  const files: Record<string, string> = {};
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (!entry.isFile() || entry.name === "state.json" || entry.name === "wal.json") continue;
+    files[entry.name] = await readFile(join(dir, entry.name), "utf8");
   }
 
-  assert.equal(await readFile(path, "utf8"), expected);
+  return files;
+};
+
+// Expected files must contain every durable file on disk and no extras.
+const expectFiles = async (dir: string, expected: ExpectedFiles): Promise<void> => {
+  const actual = await readDurableFiles(dir);
+  for (const [name, contents] of Object.entries(actual)) {
+    assert.equal(contents, expected[name], `durable file "${name}" mismatch`);
+  }
+
+  assert.equal(Object.keys(expected).length, Object.keys(actual).length, "durable file count mismatch");
 };
 
 // CrashContext maps each checkpoint to a deterministic process exit code.
@@ -145,20 +155,19 @@ export const runCrashRecoveryCase = async (testModuleUrl: string | URL, crashCas
 
     const statePath = join(dir, "state.json");
     const walPath = join(dir, "wal.json");
-    const fooPath = join(dir, "foo.txt");
 
-    assert.deepEqual(await readJson(statePath), crashCase.state);
-    assert.deepEqual(await readJson(walPath), crashCase.wal);
-    await expectFile(fooPath, crashCase.fooText);
+    assert.deepEqual(await readJson(statePath), crashCase.crashedState);
+    assert.deepEqual(await readJson(walPath), crashCase.crashedWal);
+    await expectFiles(dir, crashCase.crashedFiles);
 
     const recovered = await runChild(testModuleUrl, dir, 0);
     assert.equal(recovered.code, 0, formatChildResult(recovered));
     assert.equal(recovered.signal, null, formatChildResult(recovered));
     assert.deepEqual(await readJson(statePath), {
-      computations: { test_computation: { step: 3, vars: crashCase.finalVars } },
+      computations: { test_computation: { step: 3, vars: crashCase.recoveredVars } },
     });
     assert.deepEqual(await readJson(walPath), { computation: null, entries: [] });
-    assert.equal(await readFile(fooPath, "utf8"), "hello world");
+    await expectFiles(dir, crashCase.recoveredFiles);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

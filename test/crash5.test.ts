@@ -5,12 +5,13 @@ import { runCrashRecoveryCase } from "./crash-recovery.ts";
 test("crash 5 preserves pending file write and recovers", async () => {
   await runCrashRecoveryCase(import.meta.url, {
     crashAt: 5,
-    state: { computations: { test_computation: { step: 1, vars: { a: 5 } } } },
-    wal: {
+    crashedState: { computations: { test_computation: { step: 1, vars: { a: 5 } } } },
+    crashedWal: {
       computation: "test_computation",
       entries: [{ type: "file", name: "foo.txt", action: { type: "Write", args: ["hello "] } }],
     },
-    fooText: null,
-    finalVars: { a: 5 },
+    crashedFiles: {},
+    recoveredVars: { a: 5 },
+    recoveredFiles: { "foo.txt": "hello world" },
   });
 });

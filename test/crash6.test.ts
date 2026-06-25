@@ -5,9 +5,10 @@ import { runCrashRecoveryCase } from "./crash-recovery.ts";
 test("crash 6 preserves second committed step and recovers", async () => {
   await runCrashRecoveryCase(import.meta.url, {
     crashAt: 6,
-    state: { computations: { test_computation: { step: 2, vars: { a: 5 } } } },
-    wal: { computation: null, entries: [] },
-    fooText: "hello world",
-    finalVars: { a: 5 },
+    crashedState: { computations: { test_computation: { step: 2, vars: { a: 5 } } } },
+    crashedWal: { computation: null, entries: [] },
+    crashedFiles: { "foo.txt": "hello world" },
+    recoveredVars: { a: 5 },
+    recoveredFiles: { "foo.txt": "hello world" },
   });
 });

@@ -5,9 +5,10 @@ import { runCrashRecoveryCase } from "./crash-recovery.ts";
 test("crash 1 preserves initialized state and recovers", async () => {
   await runCrashRecoveryCase(import.meta.url, {
     crashAt: 1,
-    state: { computations: { test_computation: { step: 0, vars: {} } } },
-    wal: { computation: null, entries: [] },
-    fooText: null,
-    finalVars: { a: 5 },
+    crashedState: { computations: { test_computation: { step: 0, vars: {} } } },
+    crashedWal: { computation: null, entries: [] },
+    crashedFiles: {},
+    recoveredVars: { a: 5 },
+    recoveredFiles: { "foo.txt": "hello world" },
   });
 });

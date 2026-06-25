@@ -8,7 +8,10 @@ test("crash 1 preserves initialized state and recovers", async () => {
     crashedState: { computations: { test_computation: { step: 0, vars: {} } } },
     crashedWal: { computation: null, entries: [] },
     crashedFiles: {},
-    recoveredVars: { a: 5 },
-    recoveredFiles: { "foo.txt": "hello world" },
+    recoveries: [
+      { step: 1, vars: { a: 5 }, files: {} },
+      { step: 2, vars: { a: 5 }, files: { "foo.txt": "hello world" } },
+      { step: 3, vars: { a: 5 }, files: { "foo.txt": "hello world" } },
+    ],
   });
 });

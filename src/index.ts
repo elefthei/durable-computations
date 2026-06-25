@@ -54,6 +54,7 @@ export interface DurableContext {
 export interface DurableComputation {
   readonly name: string;
   next(step: DurableStep): this;
+  step(count: number): Promise<void>;
   run(): Promise<void>;
 }
 
@@ -255,7 +256,11 @@ class DurableComputationImpl implements DurableComputation {
     return this;
   }
 
-  async run(): Promise<void> {
+  async step(count: number): Promise<void> {
+    if (!Number.isInteger(count) || count < 0) {
+      throw new DurableComputationError("Step count must be a non-negative integer");
+    }
+
     await this.store.commitWal();
     let stepIndex = await this.store.readStep(this.name);
     if (stepIndex > this.steps.length) {
@@ -264,7 +269,8 @@ class DurableComputationImpl implements DurableComputation {
       );
     }
 
-    while (stepIndex < this.steps.length) {
+    const targetStep = Math.min(this.steps.length, stepIndex + count);
+    while (stepIndex < targetStep) {
       await this.store.commitWal();
       const step = this.steps[stepIndex]!;
       const ctx = new DurableContextImpl(this.store, this.name, this.store.readVariablesSync(this.name));
@@ -279,6 +285,10 @@ class DurableComputationImpl implements DurableComputation {
     }
 
     await this.store.commitWal();
+  }
+
+  async run(): Promise<void> {
+    await this.step(this.steps.length);
   }
 }
 

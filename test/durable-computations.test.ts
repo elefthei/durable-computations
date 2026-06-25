@@ -48,6 +48,53 @@ test("durable computation commits file, variable, and print WAL entries", async 
   }
 });
 
+test("step executes only the requested number of durable steps", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "durable-computations-"));
+  try {
+    const printed: string[] = [];
+    const factory = DurableComputationFactory.new({ dir, output: (line) => { printed.push(line); } });
+    const computation = factory
+      .create("file_move")
+      .next((ctx) => {
+        const fd = ctx.open("foo.txt");
+        fd.write("hello ");
+        ctx.set("stats", { written: true, size: 6 });
+      })
+      .next((ctx) => {
+        const fd = ctx.open("foo.txt");
+        fd.append("world");
+        ctx.modify<Stats>("stats", (stats) => { stats.size += 5; });
+      })
+      .next((ctx) => {
+        const stats = ctx.load<Stats>("stats");
+        ctx.println(`Written ${stats.size} bytes`);
+      });
+
+    await computation.step(1);
+    assert.equal(await readFile(join(dir, "foo.txt"), "utf8"), "hello ");
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), {
+      computations: { file_move: { step: 1, vars: { stats: { written: true, size: 6 } } } },
+    });
+    assert.deepEqual(printed, []);
+
+    await computation.step(1);
+    assert.equal(await readFile(join(dir, "foo.txt"), "utf8"), "hello world");
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), {
+      computations: { file_move: { step: 2, vars: { stats: { written: true, size: 11 } } } },
+    });
+    assert.deepEqual(printed, []);
+
+    await computation.run();
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "state.json"), "utf8")), {
+      computations: { file_move: { step: 3, vars: { stats: { written: true, size: 11 } } } },
+    });
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "wal.json"), "utf8")), { computation: null, entries: [] });
+    assert.deepEqual(printed, ["Written 11 bytes"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("ctx operations mirror an in-memory WAL before commit", async () => {
   const dir = await mkdtemp(join(tmpdir(), "durable-computations-"));
   try {

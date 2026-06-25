@@ -12,14 +12,20 @@ const CHILD_MODE = "--durable-crash-recovery-child";
 // Durable file expectations map filenames to exact contents.
 type ExpectedFiles = Readonly<Record<string, string>>;
 
-// Each crash file supplies disk state before and after recovery.
+// Each recovery checkpoint is observed after one step() call.
+type RecoveryExpectation = {
+  readonly step: number;
+  readonly vars: Record<string, unknown>;
+  readonly files: ExpectedFiles;
+};
+
+// Each crash file supplies disk state before crash recovery and each resumed step.
 export type CrashRecoveryCase = {
   readonly crashAt: number;
   readonly crashedState: unknown;
   readonly crashedWal: unknown;
   readonly crashedFiles: ExpectedFiles;
-  readonly recoveredVars: Record<string, unknown>;
-  readonly recoveredFiles: ExpectedFiles;
+  readonly recoveries: readonly RecoveryExpectation[];
 };
 
 // Captured child exits turn process crashes into parent-side assertions.
@@ -54,7 +60,7 @@ const assertChildRunError = (cause: unknown): ChildRunError => {
 // Read persisted JSON exactly as the parent process observes it.
 const readJson = async (path: string): Promise<unknown> => JSON.parse(await readFile(path, "utf8"));
 
-// Runtime metadata files are not durable outputs asserted by recoveredFiles.
+// Runtime metadata files are not durable outputs.
 const readDurableFiles = async (dir: string): Promise<Record<string, string>> => {
   const files: Record<string, string> = {};
   for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -90,7 +96,7 @@ class CrashContext {
 }
 
 // The child runs the same durable workflow for crash and recovery modes.
-const runCrashTest = async (dir: string, crashAt: number): Promise<void> => {
+const runCrashTest = async (dir: string, crashAt: number, stepCount: number): Promise<void> => {
   const cr = new CrashContext(crashAt);
   const dc = DurableComputationFactory.new({ dir, output: () => {} });
 
@@ -113,13 +119,13 @@ const runCrashTest = async (dir: string, crashAt: number): Promise<void> => {
     .next(() => {
       cr.crash();
     })
-    .run();
+    .step(stepCount);
 };
 
 // Fork the test module so process.exit simulates a system crash.
-const runChild = (testModuleUrl: string | URL, dir: string, crashAt: number): Promise<ChildRunResult> => {
+const runChild = (testModuleUrl: string | URL, dir: string, crashAt: number, stepCount: number): Promise<ChildRunResult> => {
   const { promise, resolve, reject } = Promise.withResolvers<ChildRunResult>();
-  const child = fork(fileURLToPath(testModuleUrl), [CHILD_MODE, dir, String(crashAt)], { silent: true });
+  const child = fork(fileURLToPath(testModuleUrl), [CHILD_MODE, dir, String(crashAt), String(stepCount)], { silent: true });
   let stdout = "";
   let stderr = "";
 
@@ -145,7 +151,7 @@ const runChild = (testModuleUrl: string | URL, dir: string, crashAt: number): Pr
 export const runCrashRecoveryCase = async (testModuleUrl: string | URL, crashCase: CrashRecoveryCase): Promise<void> => {
   const dir = await mkdtemp(join(tmpdir(), `durable-crash${crashCase.crashAt}-`));
   try {
-    const crashed = await runChild(testModuleUrl, dir, crashCase.crashAt).then(
+    const crashed = await runChild(testModuleUrl, dir, crashCase.crashAt, 3).then(
       (result) => assert.fail(`expected child crash at ${crashCase.crashAt}: ${formatChildResult(result)}`),
       (cause) => assertChildRunError(cause),
     );
@@ -160,14 +166,16 @@ export const runCrashRecoveryCase = async (testModuleUrl: string | URL, crashCas
     assert.deepEqual(await readJson(walPath), crashCase.crashedWal);
     await expectFiles(dir, crashCase.crashedFiles);
 
-    const recovered = await runChild(testModuleUrl, dir, 0);
-    assert.equal(recovered.code, 0, formatChildResult(recovered));
-    assert.equal(recovered.signal, null, formatChildResult(recovered));
-    assert.deepEqual(await readJson(statePath), {
-      computations: { test_computation: { step: 3, vars: crashCase.recoveredVars } },
-    });
-    assert.deepEqual(await readJson(walPath), { computation: null, entries: [] });
-    await expectFiles(dir, crashCase.recoveredFiles);
+    for (const recovery of crashCase.recoveries) {
+      const recovered = await runChild(testModuleUrl, dir, 0, 1);
+      assert.equal(recovered.code, 0, formatChildResult(recovered));
+      assert.equal(recovered.signal, null, formatChildResult(recovered));
+      assert.deepEqual(await readJson(statePath), {
+        computations: { test_computation: { step: recovery.step, vars: recovery.vars } },
+      });
+      assert.deepEqual(await readJson(walPath), { computation: null, entries: [] });
+      await expectFiles(dir, recovery.files);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -177,8 +185,9 @@ export const runCrashRecoveryCase = async (testModuleUrl: string | URL, crashCas
 if (process.argv[2] === CHILD_MODE) {
   const dir = process.argv[3];
   const crashAt = Number(process.argv[4] ?? Number.NaN);
-  if (dir === undefined || !Number.isInteger(crashAt) || crashAt < 0) process.exit(64);
+  const stepCount = Number(process.argv[5] ?? Number.NaN);
+  if (dir === undefined || !Number.isInteger(crashAt) || crashAt < 0 || !Number.isInteger(stepCount) || stepCount < 0) process.exit(64);
 
-  await runCrashTest(dir, crashAt);
+  await runCrashTest(dir, crashAt, stepCount);
   process.exit(0);
 }

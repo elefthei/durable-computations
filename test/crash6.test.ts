@@ -8,7 +8,8 @@ test("crash 6 preserves second committed step and recovers", async () => {
     crashedState: { computations: { test_computation: { step: 2, vars: { a: 5 } } } },
     crashedWal: { computation: null, entries: [] },
     crashedFiles: { "foo.txt": "hello world" },
-    recoveredVars: { a: 5 },
-    recoveredFiles: { "foo.txt": "hello world" },
+    recoveries: [
+      { step: 3, vars: { a: 5 }, files: { "foo.txt": "hello world" } },
+    ],
   });
 });

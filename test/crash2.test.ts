@@ -11,7 +11,10 @@ test("crash 2 preserves pending variable set and recovers", async () => {
       entries: [{ type: "var", name: "a", action: { type: "Set", args: [3] } }],
     },
     crashedFiles: {},
-    recoveredVars: { a: 5 },
-    recoveredFiles: { "foo.txt": "hello world" },
+    recoveries: [
+      { step: 1, vars: { a: 5 }, files: {} },
+      { step: 2, vars: { a: 5 }, files: { "foo.txt": "hello world" } },
+      { step: 3, vars: { a: 5 }, files: { "foo.txt": "hello world" } },
+    ],
   });
 });

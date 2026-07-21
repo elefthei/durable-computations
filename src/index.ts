@@ -1,61 +1,42 @@
-import { readFile, readFileSync, writeFile, writeFileSync } from "atomically";
+import { readFileSync, writeFile, writeFileSync } from "atomically";
+import { mkdirSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
-
-export type DurableFileAction =
-  | { readonly type: "Write"; readonly args: readonly [string] }
-  | { readonly type: "Append"; readonly args: readonly [string] };
-
-export type DurableVariableAction = { readonly type: "Set"; readonly args: readonly [unknown] };
-export type DurableIoAction = { readonly type: "Print"; readonly args: readonly [string] };
-
-export type DurableWalEntry =
-  | { readonly type: "file"; readonly name: string; readonly action: DurableFileAction }
-  | { readonly type: "var"; readonly name: string; readonly action: DurableVariableAction }
-  | { readonly type: "io"; readonly action: DurableIoAction };
+import { Database } from "bun:sqlite";
 
 export type DurableVariables = Record<string, unknown>;
-export type DurableComputationState = {
-  readonly step: number;
-  readonly vars: DurableVariables;
-};
-export type DurableComputationStates = Record<string, DurableComputationState>;
-export type DurableState = {
-  readonly computations: DurableComputationStates;
-};
-export type DurableWal = {
-  readonly computation: string | null;
-  readonly entries: readonly DurableWalEntry[];
-};
-export type DurableStep = (ctx: DurableContext) => void | Promise<void>;
+
+export type DurableOp<T = unknown> =
+  | { readonly type: "file"; readonly path: string; readonly data: string }
+  | { readonly type: "var"; readonly name: string; readonly value: unknown }
+  | { readonly type: "io"; readonly message: string }
+  | { readonly type: "log"; readonly entry: T };
+
 export type DurableOutput = (line: string) => void | Promise<void>;
 
-export type DurableComputationFactoryOptions = {
+export type DurableContextOptions = {
   readonly dir: string;
+  readonly name: string;
   readonly output?: DurableOutput;
 };
 
-export type DurableComputationCreateOptions = {
-  readonly name: string;
-};
-
-export interface DurableFileHandle {
-  write(data: string): void;
-  append(data: string): void;
+export interface DurableFile {
+  readonly path: string;
 }
 
 export interface DurableContext {
-  open(name: string): DurableFileHandle;
-  set<T>(name: string, value: T): void;
-  load<T = unknown>(name: string): T;
-  modify<T = unknown>(name: string, update: (value: T) => T | void): T;
-  println(message: string): void;
-}
-
-export interface DurableComputation {
   readonly name: string;
-  next(step: DurableStep): this;
-  step(count: number): Promise<void>;
-  run(): Promise<void>;
+  openFile(path: string): DurableFile;
+  readFile(file: DurableFile): string;
+  writeFile(file: DurableFile, data: string): void;
+  loadVar<T = unknown>(name: string): T;
+  storeVar<T>(name: string, value: T): void;
+  println(message: string): void;
+  log<T>(entry: T): void;
+  readLog<T = unknown>(): readonly T[];
+  commit(): Promise<void>;
+  lastCommit(): number;
+  snapshotVars(): DurableVariables;
+  dispose(): void;
 }
 
 export class DurableComputationError extends Error {
@@ -65,256 +46,267 @@ export class DurableComputationError extends Error {
   }
 }
 
-class DurableStore {
-  readonly dir: string;
-  readonly walPath: string;
-  readonly statePath: string;
+abstract class AbstractDurableContext implements DurableContext {
+  readonly name: string;
+  protected readonly dir: string;
   private readonly output: DurableOutput;
+  private readonly vars = new Map<string, unknown>();
+  private readonly files = new Map<string, string>();
+  private pending: DurableOp[] = [];
+  private committed = -1;
 
-  constructor(options: DurableComputationFactoryOptions) {
+  protected constructor(options: DurableContextOptions) {
+    if (options.name.length === 0) throw new DurableComputationError("Durable computation name must not be empty");
     this.dir = resolve(options.dir);
-    this.walPath = resolve(this.dir, "wal.json");
-    this.statePath = resolve(this.dir, "state.json");
+    this.name = options.name;
     this.output = options.output ?? ((line) => console.log(line));
-    this.ensureFiles();
   }
 
-  ensureComputation(name: string): void {
-    const state = this.readStateSync();
-    if (state.computations[name] !== undefined) return;
-    state.computations[name] = { step: 0, vars: {} };
-    writeJsonSync(this.statePath, state);
-  }
+  // Concrete backends implement these; called only after the subclass constructor is ready.
+  protected abstract readBatches(): readonly (readonly DurableOp[])[];
+  protected abstract appendBatch(ops: readonly DurableOp[]): void;
 
-  async readStep(name: string): Promise<number> {
-    const state = await readJson(this.statePath, EMPTY_STATE);
-    const step = state.computations[name]?.step ?? 0;
-    if (!Number.isInteger(step) || step < 0) {
-      throw new DurableComputationError(`Stored state for computation "${name}" must be a non-negative integer`);
-    }
-    return step;
-  }
-
-  writeStepSync(name: string, step: number): void {
-    const state = this.readStateSync();
-    const computation = state.computations[name];
-    state.computations[name] = { step, vars: computation?.vars ?? {} };
-    writeJsonSync(this.statePath, state);
-  }
-
-  clearWalSync(): void {
-    writeJsonSync(this.walPath, EMPTY_WAL);
-  }
-
-  readVariablesSync(name: string): DurableVariables {
-    return this.readStateSync().computations[name]?.vars ?? {};
-  }
-
-  async commitWal(): Promise<void> {
-    const wal = await readJson(this.walPath, EMPTY_WAL);
-    if (wal.entries.length === 0) return;
-    if (wal.computation === null) {
-      throw new DurableComputationError("WAL contains entries without a computation name");
-    }
-
-    const state = await readJson(this.statePath, EMPTY_STATE);
-    let computation = state.computations[wal.computation];
-    let stateDirty = false;
-    if (computation === undefined) {
-      computation = { step: 0, vars: {} };
-      state.computations[wal.computation] = computation;
-      stateDirty = true;
-    }
-
-    for (const entry of wal.entries) {
-      switch (entry.type) {
-        case "file":
-          await this.commitFileEntry(entry);
-          break;
-        case "var":
-          computation.vars[entry.name] = cloneJson(entry.action.args[0]);
-          stateDirty = true;
-          break;
-        case "io":
-          await this.output(entry.action.args[0]);
-          break;
+  // Subclasses call this at the END of their constructor to replay + materialize.
+  protected recover(): void {
+    const batches = this.readBatches();
+    for (const ops of batches) {
+      for (const op of ops) {
+        if (op.type === "file") this.files.set(op.path, op.data);
+        else if (op.type === "var") this.vars.set(op.name, cloneJson(op.value));
+        // io ops are not re-emitted on replay
       }
     }
-
-    if (stateDirty) await writeJson(this.statePath, state);
-    await writeJson(this.walPath, EMPTY_WAL);
+    this.committed = batches.length - 1;
+    this.materializeSync();
   }
 
-  resolveDataPath(name: string): string {
-    if (name.length === 0) throw new DurableComputationError("Durable file name must not be empty");
-    const target = resolve(this.dir, name);
-    const pathFromRoot = relative(this.dir, target);
-    if (pathFromRoot.length === 0 || pathFromRoot.startsWith("..") || isAbsolute(pathFromRoot)) {
-      throw new DurableComputationError(`Durable file "${name}" escapes the computation directory`);
+  private resolveDataPath(path: string): string {
+    if (path.length === 0) throw new DurableComputationError("Durable file name must not be empty");
+    const target = resolve(this.dir, path);
+    const fromRoot = relative(this.dir, target);
+    if (fromRoot.length === 0 || fromRoot.startsWith("..") || isAbsolute(fromRoot)) {
+      throw new DurableComputationError(`Durable file "${path}" escapes the computation directory`);
     }
     return target;
   }
 
-  private ensureFiles(): void {
-    ensureJsonFileSync(this.walPath, EMPTY_WAL);
-    ensureJsonFileSync(this.statePath, EMPTY_STATE);
+  private materializeSync(): void {
+    for (const [path, data] of this.files) writeFileSync(this.resolveDataPath(path), data);
+  }
+  private async materialize(): Promise<void> {
+    for (const [path, data] of this.files) await writeFile(this.resolveDataPath(path), data);
   }
 
-  private readStateSync(): DurableState {
-    return readJsonSync(this.statePath, EMPTY_STATE);
+  openFile(path: string): DurableFile {
+    this.resolveDataPath(path);
+    return { path };
   }
-
-  private async commitFileEntry(entry: Extract<DurableWalEntry, { readonly type: "file" }>): Promise<void> {
-    const target = this.resolveDataPath(entry.name);
-    const [data] = entry.action.args;
-    switch (entry.action.type) {
-      case "Write":
-        await writeFile(target, data);
-        return;
-      case "Append": {
-        const current = await readTextIfExists(target);
-        await writeFile(target, current + data);
-        return;
-      }
-    }
+  readFile(file: DurableFile): string {
+    return this.files.get(file.path) ?? "";
   }
-}
-
-class DurableFileHandleImpl implements DurableFileHandle {
-  constructor(
-    private readonly context: DurableContextImpl,
-    private readonly name: string,
-  ) {}
-
-  write(data: string): void {
-    this.context.appendWalEntry({ type: "file", name: this.name, action: { type: "Write", args: [data] } });
+  writeFile(file: DurableFile, data: string): void {
+    this.files.set(file.path, data);
+    this.pending.push({ type: "file", path: file.path, data });
   }
-
-  append(data: string): void {
-    this.context.appendWalEntry({ type: "file", name: this.name, action: { type: "Append", args: [data] } });
+  loadVar<T = unknown>(name: string): T {
+    if (!this.vars.has(name)) throw new DurableComputationError(`Durable variable "${name}" is not set`);
+    return cloneJson(this.vars.get(name)) as T;
   }
-}
-
-class DurableContextImpl implements DurableContext {
-  private readonly variables: DurableVariables;
-  private readonly wal: DurableWalEntry[] = [];
-
-  constructor(
-    private readonly store: DurableStore,
-    private readonly computationName: string,
-    variables: DurableVariables,
-  ) {
-    this.variables = cloneJson(variables);
-  }
-
-  open(name: string): DurableFileHandle {
-    this.store.resolveDataPath(name);
-    return new DurableFileHandleImpl(this, name);
-  }
-
-  set<T>(name: string, value: T): void {
+  storeVar<T>(name: string, value: T): void {
     const persisted = cloneJson(value);
-    this.variables[name] = persisted;
-    this.appendWalEntry({ type: "var", name, action: { type: "Set", args: [persisted] } });
+    this.vars.set(name, persisted);
+    this.pending.push({ type: "var", name, value: persisted });
   }
-
-  load<T = unknown>(name: string): T {
-    if (!Object.hasOwn(this.variables, name)) {
-      throw new DurableComputationError(`Durable variable "${name}" is not set`);
-    }
-    return cloneJson(this.variables[name]) as T;
-  }
-
-  modify<T = unknown>(name: string, update: (value: T) => T | void): T {
-    const working = this.load<T>(name);
-    const updated = update(working);
-    const value = updated === undefined ? working : updated;
-    this.set(name, value);
-    return this.load<T>(name);
-  }
-
   println(message: string): void {
-    this.appendWalEntry({ type: "io", action: { type: "Print", args: [message] } });
+    this.pending.push({ type: "io", message });
+  }
+  log<T>(entry: T): void {
+    this.pending.push({ type: "log", entry: cloneJson(entry) });
+  }
+  readLog<T = unknown>(): readonly T[] {
+    const out: T[] = [];
+    for (const batch of [...this.readBatches(), this.pending]) {
+      for (const op of batch) if (op.type === "log") out.push(cloneJson(op.entry) as T);
+    }
+    return out;
   }
 
-  appendWalEntry(entry: DurableWalEntry): void {
-    this.wal.push(cloneJson(entry));
-    writeJsonSync(this.store.walPath, { computation: this.computationName, entries: this.wal });
+  async commit(): Promise<void> {
+    const ops = this.pending;
+    this.appendBatch(ops);
+    this.committed += 1;
+    this.pending = [];
+    for (const op of ops) if (op.type === "io") await this.output(op.message);
+    await this.materialize();
+  }
+
+  lastCommit(): number {
+    return this.committed;
+  }
+  snapshotVars(): DurableVariables {
+    const out: DurableVariables = {};
+    for (const [k, v] of this.vars) out[k] = cloneJson(v);
+    return out;
+  }
+  dispose(): void {}
+}
+
+export type InMemoryEvent =
+  | DurableOp
+  | { readonly type: "commit"; readonly index: number; readonly message: string };
+
+export class InMemoryContext extends AbstractDurableContext {
+  private readonly batches: (readonly DurableOp[])[] = [];
+  private readonly events: InMemoryEvent[] = [];
+  private readonly subscribers = new Set<(event: InMemoryEvent) => void>();
+  private readonly commitOutput: DurableOutput;
+
+  private constructor(options: DurableContextOptions) {
+    super(options);
+    this.commitOutput = options.output ?? ((line) => console.log(line));
+    this.recover();
+  }
+  static new(dir: string, name: string, output?: DurableOutput): InMemoryContext {
+    return new InMemoryContext({ dir, name, output });
+  }
+  protected readBatches(): readonly (readonly DurableOp[])[] {
+    return this.batches;
+  }
+  protected appendBatch(ops: readonly DurableOp[]): void {
+    this.batches.push(ops);
+  }
+  readEvents(): readonly InMemoryEvent[] {
+    return cloneJson(this.events);
+  }
+  subscribe(listener: (event: InMemoryEvent) => void): () => void {
+    this.subscribers.add(listener);
+    return () => {
+      this.subscribers.delete(listener);
+    };
+  }
+  private record(event: InMemoryEvent): void {
+    this.events.push(event);
+    for (const listener of [...this.subscribers]) listener(cloneJson(event));
+  }
+  writeFile(file: DurableFile, data: string): void {
+    super.writeFile(file, data);
+    this.record({ type: "file", path: file.path, data });
+  }
+  storeVar<T>(name: string, value: T): void {
+    const persisted = cloneJson(value);
+    super.storeVar(name, persisted);
+    this.record({ type: "var", name, value: persisted });
+  }
+  println(message: string): void {
+    super.println(message);
+    this.record({ type: "io", message });
+  }
+  log<T>(entry: T): void {
+    const persisted = cloneJson(entry);
+    super.log(persisted);
+    this.record({ type: "log", entry: persisted });
+  }
+  async commit(): Promise<void> {
+    await super.commit();
+    const index = this.lastCommit();
+    const message = `Committed ${this.name} at ${index}`;
+    this.record({ type: "commit", index, message });
+    await this.commitOutput(message);
   }
 }
 
-class DurableComputationImpl implements DurableComputation {
-  private readonly steps: DurableStep[] = [];
+export class FileDurableContext extends AbstractDurableContext {
+  private readonly walPath: string;
 
-  constructor(
-    private readonly store: DurableStore,
-    readonly name: string,
-  ) {}
+  private constructor(options: DurableContextOptions) {
+    super(options);
+    const metaDir = resolve(this.dir, ".durable");
+    mkdirSync(metaDir, { recursive: true });
+    this.walPath = resolve(metaDir, `${this.name}.wal.json`);
+    this.recover();
+  }
+  static new(dir: string, name: string, output?: DurableOutput): FileDurableContext {
+    return new FileDurableContext({ dir, name, output });
+  }
+  protected readBatches(): readonly (readonly DurableOp[])[] {
+    return readJsonSync<DurableOp[][]>(this.walPath, []);
+  }
+  protected appendBatch(ops: readonly DurableOp[]): void {
+    writeJsonSync(this.walPath, [...this.readBatches(), ops]);
+  }
+}
 
-  next(step: DurableStep): this {
+export class SqlDurableContext extends AbstractDurableContext {
+  private readonly db: Database;
+
+  private constructor(options: DurableContextOptions) {
+    super(options);
+    const metaDir = resolve(this.dir, ".durable");
+    mkdirSync(metaDir, { recursive: true });
+    this.db = new Database(resolve(metaDir, `${this.name}.wal.sqlite`));
+    this.db.run("PRAGMA journal_mode = DELETE");
+    this.db.run("PRAGMA synchronous = FULL");
+    this.db.run("CREATE TABLE IF NOT EXISTS log (idx INTEGER PRIMARY KEY, ops TEXT NOT NULL)");
+    this.recover();
+  }
+  static new(dir: string, name: string, output?: DurableOutput): SqlDurableContext {
+    return new SqlDurableContext({ dir, name, output });
+  }
+  protected readBatches(): readonly (readonly DurableOp[])[] {
+    const rows = this.db.query("SELECT ops FROM log ORDER BY idx").all() as { ops: string }[];
+    return rows.map((r) => JSON.parse(r.ops) as DurableOp[]);
+  }
+  protected appendBatch(ops: readonly DurableOp[]): void {
+    this.db.query("INSERT INTO log (ops) VALUES (?)").run(JSON.stringify(ops));
+  }
+  dispose(): void {
+    this.db.close();
+  }
+}
+
+type DurableStep<Ctx extends DurableContext> = (ctx: Ctx) => void | Promise<void>;
+
+export class DurableComputation<Ctx extends DurableContext = DurableContext> {
+  private readonly steps: DurableStep<Ctx>[] = [];
+  private runPromise: Promise<void> | null = null;
+
+  private constructor(private readonly ctx: Ctx) {}
+
+  static create<Ctx extends DurableContext>(ctx: Ctx): DurableComputation<Ctx> {
+    return new DurableComputation(ctx);
+  }
+
+  next(step: DurableStep<Ctx>): this {
     this.steps.push(step);
     return this;
   }
 
-  async step(count: number): Promise<void> {
-    if (!Number.isInteger(count) || count < 0) {
-      throw new DurableComputationError("Step count must be a non-negative integer");
-    }
-
-    await this.store.commitWal();
-    let stepIndex = await this.store.readStep(this.name);
-    if (stepIndex > this.steps.length) {
+  private async run(): Promise<void> {
+    const last = this.ctx.lastCommit();
+    if (last + 1 > this.steps.length) {
       throw new DurableComputationError(
-        `Stored state ${stepIndex} for computation "${this.name}" is ahead of ${this.steps.length} registered step(s)`,
+        `Stored last commit ${last} for computation "${this.ctx.name}" is ahead of ${this.steps.length} registered step(s)`,
       );
     }
-
-    const targetStep = Math.min(this.steps.length, stepIndex + count);
-    while (stepIndex < targetStep) {
-      await this.store.commitWal();
-      const step = this.steps[stepIndex]!;
-      const ctx = new DurableContextImpl(this.store, this.name, this.store.readVariablesSync(this.name));
-      try {
-        await step(ctx);
-      } catch (cause) {
-        this.store.clearWalSync();
-        throw cause;
+    try {
+      for (let i = 0; i < this.steps.length; i++) {
+        if (i <= last) continue;
+        await this.steps[i]!(this.ctx);
+        await this.ctx.commit();
       }
-      stepIndex += 1;
-      this.store.writeStepSync(this.name, stepIndex);
+    } finally {
+      this.ctx.dispose();
     }
-
-    await this.store.commitWal();
   }
 
-  async run(): Promise<void> {
-    await this.step(this.steps.length);
-  }
-}
-
-export class DurableComputationFactory {
-  private readonly store: DurableStore;
-
-  private constructor(options: DurableComputationFactoryOptions) {
-    this.store = new DurableStore(options);
-  }
-
-  static new(options: string | DurableComputationFactoryOptions): DurableComputationFactory {
-    return new DurableComputationFactory(typeof options === "string" ? { dir: options } : options);
-  }
-
-  create(options: string | DurableComputationCreateOptions): DurableComputation {
-    const name = typeof options === "string" ? options : options.name;
-    if (name.length === 0) throw new DurableComputationError("Durable computation name must not be empty");
-    this.store.ensureComputation(name);
-    return new DurableComputationImpl(this.store, name);
+  then<R1 = void, R2 = never>(
+    onfulfilled?: ((value: void) => R1 | PromiseLike<R1>) | null,
+    onrejected?: ((reason: unknown) => R2 | PromiseLike<R2>) | null,
+  ): Promise<R1 | R2> {
+    this.runPromise ??= this.run();
+    return this.runPromise.then(onfulfilled, onrejected);
   }
 }
-
-export default DurableComputationFactory;
-
-const EMPTY_WAL: DurableWal = { computation: null, entries: [] };
-const EMPTY_STATE: DurableState = { computations: {} };
 
 const isNotFound = (cause: unknown): boolean =>
   typeof cause === "object" && cause !== null && "code" in cause && (cause as NodeJS.ErrnoException).code === "ENOENT";
@@ -334,37 +326,6 @@ const readJsonSync = <T>(filePath: string, fallback: T): T => {
   }
 };
 
-const readJson = async <T>(filePath: string, fallback: T): Promise<T> => {
-  try {
-    return JSON.parse(await readFile(filePath, "utf8")) as T;
-  } catch (cause) {
-    if (isNotFound(cause)) return cloneJson(fallback);
-    throw cause;
-  }
-};
-
 const writeJsonSync = (filePath: string, value: unknown): void => {
   writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
-};
-
-const writeJson = async (filePath: string, value: unknown): Promise<void> => {
-  await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
-};
-
-const ensureJsonFileSync = <T>(filePath: string, fallback: T): void => {
-  try {
-    readFileSync(filePath, "utf8");
-  } catch (cause) {
-    if (!isNotFound(cause)) throw cause;
-    writeJsonSync(filePath, fallback);
-  }
-};
-
-const readTextIfExists = async (filePath: string): Promise<string> => {
-  try {
-    return await readFile(filePath, "utf8");
-  } catch (cause) {
-    if (isNotFound(cause)) return "";
-    throw cause;
-  }
 };

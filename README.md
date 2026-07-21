@@ -1,6 +1,13 @@
 # durable-computations
 
-Persistent task computations for TypeScript. Each `next` step records file, variable, and print operations into an in-memory write-ahead log mirrored to `wal.json` with `atomically`; the log is committed between steps.
+Durable computations for TypeScript. A `DurableContext` buffers file, variable, and print operations; each `next` step commits its buffer as one atomic batch to an append-only write-ahead log (WAL). Constructing a context replays the committed batches, so an interrupted computation resumes at the first uncommitted step.
+
+Two persistent contexts implement the same interface:
+
+- `FileDurableContext` — WAL stored as JSON at `<dir>/.durable/<name>.wal.json`.
+- `SqlDurableContext` — WAL stored in a `bun:sqlite` database at `<dir>/.durable/<name>.wal.sqlite`. Requires the Bun runtime.
+
+For tests, `InMemoryContext` keeps committed batches and `readEvents()` history only for the lifetime of one instance. `subscribe()` observes each newly recorded operation and commit event. It creates no WAL metadata, but inherits the normal durable-file materialization behavior when committing.
 
 ## Install
 
@@ -22,12 +29,12 @@ Use an explicit durable state directory:
 bun run start /tmp/durable-file-move
 ```
 
-The demo writes `foo.txt`, updates `state.json`, clears `wal.json`, and prints `Written 11 bytes`.
+The demo writes `foo.txt`, records the WAL under `.durable/`, and prints `Written 11 bytes`.
 
 ## Test and build
 
 ```sh
-bun run test
+bun run test        # runs file and SQL cases selected explicitly by name
 bun run typecheck
 bun run build
 ```
@@ -35,36 +42,36 @@ bun run build
 ## Library usage
 
 ```ts
-import { DurableComputationFactory } from "durable-computations";
+import { DurableComputation, FileDurableContext } from "durable-computations";
 
-const dc = DurableComputationFactory.new({ dir: "/tmp/durable-file-move" });
+type Stats = { written: boolean; size: number };
 
-await dc
-  .create("file_move")
-  .next((ctx) => {
-    const fd = ctx.open("foo.txt");
-    fd.write("hello ");
-    ctx.set("stats", { written: true, size: 6 });
+const ctx = FileDurableContext.new("/tmp/durable-file-move", "file_move");
+// For the SQLite-backed WAL instead: SqlDurableContext.new("/tmp/durable-file-move", "file_move");
+
+await DurableComputation.create(ctx)
+  .next((c) => {
+    const f = c.openFile("foo.txt");
+    c.writeFile(f, "hello ");
+    c.storeVar<Stats>("stats", { written: true, size: 6 });
   })
-  .next((ctx) => {
-    const fd = ctx.open("foo.txt");
-    fd.append("world");
-    ctx.modify<{ written: boolean; size: number }>("stats", (stats) => {
-      stats.size += 5;
-    });
+  .next((c) => {
+    const f = c.openFile("foo.txt");
+    c.writeFile(f, c.readFile(f) + "world"); // readFile returns the in-memory buffer
+    const s = c.loadVar<Stats>("stats");
+    c.storeVar<Stats>("stats", { ...s, size: s.size + 5 });
   })
-  .next((ctx) => {
-    const stats = ctx.load<{ written: boolean; size: number }>("stats");
-    ctx.println(`Written ${stats.size} bytes`);
-  })
-  .run();
+  .next((c) => {
+    c.println(`Written ${c.loadVar<Stats>("stats").size} bytes`);
+  });
 ```
 
-## Durable files
+`DurableComputation` is a thenable: `next(step)` registers a step and returns the computation, and awaiting it runs the registered steps exactly once. Steps already committed to the WAL (index `<= lastCommit`) are skipped on resume, so re-running a completed or interrupted chain resumes at the first uncommitted step.
 
-For a factory created with `dir`, the runtime manages:
+## Durable files and recovery
 
-- `wal.json` — the current step's write-ahead log plus its owning computation name.
-- `state.json` — one entry per durable computation under computations; each entry stores step and vars.
-
-File paths opened through `ctx.open(path)` are resolved under `dir` and cannot escape it.
+- Durable files are **virtual**: `writeFile(file, data)` records the full content in the WAL, and `readFile(file)` returns the current in-memory (replayed) buffer (`""` if never written). Files are materialized to `<dir>/<path>` when their step commits.
+- Each `next` step commits one WAL batch; a crash mid-step discards that step's buffered ops, leaving the WAL at the previous commit.
+- Constructing a context replays every committed batch to rebuild variables and file contents and re-materializes files to disk.
+- File paths opened through `openFile(path)` are resolved under `dir` and cannot escape it.
+- WAL artifacts live under the `<dir>/.durable/` subdirectory, separate from the materialized durable files at the `dir` root.

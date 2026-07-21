@@ -2,36 +2,34 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DurableComputationFactory, type DurableOutput } from "./index.js";
+import { DurableComputation, FileDurableContext, type DurableOutput } from "./index.js";
 
 export type DurableComputationMainOptions = {
   readonly dir?: string;
   readonly output?: DurableOutput;
 };
 
+type Stats = { written: boolean; size: number };
+
 export async function main(options: DurableComputationMainOptions = {}): Promise<string> {
   const dir = options.dir ?? (await mkdtemp(join(tmpdir(), "durable-computations-")));
-  const factory = DurableComputationFactory.new({ dir, output: options.output });
+  const ctx = FileDurableContext.new(dir, "file_move", options.output);
 
-  await factory
-    .create("file_move")
-    .next((ctx) => {
-      const fd = ctx.open("foo.txt");
-      fd.write("hello ");
-      ctx.set("stats", { written: true, size: 6 });
+  await DurableComputation.create(ctx)
+    .next((c) => {
+      const f = c.openFile("foo.txt");
+      c.writeFile(f, "hello ");
+      c.storeVar<Stats>("stats", { written: true, size: 6 });
     })
-    .next((ctx) => {
-      const fd = ctx.open("foo.txt");
-      fd.append("world");
-      ctx.modify<{ written: boolean; size: number }>("stats", (stats) => {
-        stats.size += 5;
-      });
+    .next((c) => {
+      const f = c.openFile("foo.txt");
+      c.writeFile(f, c.readFile(f) + "world");
+      const stats = c.loadVar<Stats>("stats");
+      c.storeVar<Stats>("stats", { ...stats, size: stats.size + 5 });
     })
-    .next((ctx) => {
-      const stats = ctx.load<{ written: boolean; size: number }>("stats");
-      ctx.println(`Written ${stats.size} bytes`);
-    })
-    .run();
+    .next((c) => {
+      c.println(`Written ${c.loadVar<Stats>("stats").size} bytes`);
+    });
 
   return dir;
 }
